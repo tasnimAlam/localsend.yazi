@@ -22,6 +22,17 @@ PORT = 53_317
 module LocalSend
   module_function
 
+  # yazi restores its UI the instant this process exits, wiping anything left on
+  # screen, so hold the terminal until the user has actually read the message.
+  def fatal(message)
+    warn message
+    if $stdin.tty?
+      warn 'Press Enter to return to yazi...'
+      $stdin.gets
+    end
+    exit 1
+  end
+
   # LocalSend speaks mutual TLS: the server aborts the handshake without a
   # client certificate, and a device's fingerprint is that certificate's
   # SHA-256. Cached so the fingerprint stays stable across runs.
@@ -74,7 +85,7 @@ module LocalSend
     end
   end
 
-  def http(device, read_timeout: 10, open_timeout: 3)
+  def http(device, read_timeout: 10, open_timeout: 3, write_timeout: 60)
     cert, key, = certificate
     h = Net::HTTP.new(device['ip'], device['port'] || PORT)
     if (device['protocol'] || 'https') == 'https'
@@ -87,6 +98,7 @@ module LocalSend
     end
     h.open_timeout = open_timeout
     h.read_timeout = read_timeout
+    h.write_timeout = write_timeout
     h
   end
 
@@ -227,9 +239,9 @@ module LocalSend
 
     case res.code
     when '200' then nil
-    when '401' then abort 'Device requires a PIN — not supported, send from the LocalSend app.'
-    when '403' then abort 'Device declined the request.'
-    else abort "prepare-upload failed: HTTP #{res.code} #{res.body.to_s[0, 200]}"
+    when '401' then fatal 'Device requires a PIN — not supported, send from the LocalSend app.'
+    when '403' then fatal 'Device declined the request.'
+    else fatal "prepare-upload failed: HTTP #{res.code} #{res.body.to_s[0, 200]}"
     end
 
     session = JSON.parse(res.body)
@@ -255,8 +267,9 @@ module LocalSend
 
     File.open(meta[:path], 'rb') do |f|
       req.body_stream = f
-      # No read timeout: a large file may legitimately take a long time.
-      res = http(device, read_timeout: nil).request(req)
+      # No read or write timeout: a large file over a weak link may legitimately
+      # stall for a long time without the transfer being dead.
+      res = http(device, read_timeout: nil, write_timeout: nil).request(req)
       if %w[200 204].include?(res.code)
         puts '  done'
       else
@@ -264,28 +277,34 @@ module LocalSend
       end
     end
   rescue StandardError => e
-    puts "  failed: #{e.message}"
+    puts "  failed: #{e.class}: #{e.message}"
   end
 end
 
 if __FILE__ == $PROGRAM_NAME
   paths = ARGV
-  abort 'No files given.' if paths.empty?
+  LocalSend.fatal 'No files given.' if paths.empty?
   paths.each do |p|
-    abort "#{p} is a directory — LocalSend sends files only." if File.directory?(p)
-    abort "#{p} does not exist." unless File.file?(p)
+    LocalSend.fatal "#{p} is a directory — LocalSend sends files only." if File.directory?(p)
+    LocalSend.fatal "#{p} does not exist." unless File.file?(p)
   end
 
-  puts 'Scanning for LocalSend devices...'
-  devices = LocalSend.discover_multicast
-  if devices.empty?
-    puts 'No multicast reply, sweeping the local subnet...'
-    devices = LocalSend.discover_sweep
+  begin
+    puts 'Scanning for LocalSend devices...'
+    devices = LocalSend.discover_multicast
+    if devices.empty?
+      puts 'No multicast reply, sweeping the local subnet...'
+      devices = LocalSend.discover_sweep
+    end
+    LocalSend.fatal 'No LocalSend devices found. Is the app open and on the same network?' if devices.empty?
+
+    target = LocalSend.pick(devices)
+    exit if target.nil?
+
+    LocalSend.send_files(target, paths)
+  rescue Interrupt
+    exit 130
+  rescue StandardError => e
+    LocalSend.fatal "#{e.class}: #{e.message}"
   end
-  abort 'No LocalSend devices found. Is the app open and on the same network?' if devices.empty?
-
-  target = LocalSend.pick(devices)
-  exit if target.nil?
-
-  LocalSend.send_files(target, paths)
 end

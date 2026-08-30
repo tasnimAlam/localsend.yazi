@@ -2,8 +2,10 @@
 
 local selected_or_hovered = ya.sync(function()
 	local tab, paths = cx.active, {}
-	for _, u in pairs(tab.selected) do
-		paths[#paths + 1] = tostring(u)
+	-- tab.selected yields File values, not Urls, and it is a lazy iterator, so
+	-- it needs pairs() rather than ipairs().
+	for _, f in pairs(tab.selected) do
+		paths[#paths + 1] = tostring(f.url)
 	end
 	if #paths == 0 and tab.current.hovered then
 		paths[1] = tostring(tab.current.hovered.url)
