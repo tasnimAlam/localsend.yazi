@@ -18,6 +18,8 @@ require 'uri'
 
 MULTICAST = '224.0.0.167'
 PORT = 53_317
+SWEEP_CONCURRENCY = 128
+MAX_SWEEP_HOSTS = 1022 # a /22; past that the sweep takes longer than anyone waits
 
 module LocalSend
   module_function
@@ -102,9 +104,76 @@ module LocalSend
     h
   end
 
+  # A device answering our announcement may reply over HTTP instead of
+  # multicast, POSTing its info to /register on the port we advertised. Without
+  # a server listening those replies hit a closed port and discovery sees
+  # nothing, so run one for as long as the scan lasts.
+  def start_register_listener(found, mutex)
+    cert, key, = certificate
+    ctx = OpenSSL::SSL::SSLContext.new
+    ctx.cert = cert
+    ctx.key = key
+
+    tcp = begin
+      TCPServer.new('0.0.0.0', PORT)
+    rescue SystemCallError
+      return nil # A LocalSend app already holds the port; it will collect them.
+    end
+
+    server = OpenSSL::SSL::SSLServer.new(tcp, ctx)
+    server.start_immediately = false
+
+    thread = Thread.new do
+      loop do
+        conn = server.accept
+        Thread.new { handle_register(conn, found, mutex) }
+      rescue StandardError
+        break
+      end
+    end
+
+    [thread, tcp]
+  end
+
+  def handle_register(conn, found, mutex)
+    conn.accept # TLS handshake, off the accept loop so a stalled peer cannot block it
+    peer = conn.io.peeraddr[3]
+    request_line = conn.gets
+    headers = {}
+    while (line = conn.gets) && line != "\r\n"
+      key, value = line.split(':', 2)
+      headers[key.downcase] = value.to_s.strip
+    end
+    body = headers['content-length'] ? conn.read(headers['content-length'].to_i) : ''
+
+    if request_line.to_s.include?('/register')
+      info = JSON.parse(body)
+      if info.is_a?(Hash) && info['fingerprint'] != self_info['fingerprint']
+        info['ip'] = peer
+        info['port'] ||= PORT
+        mutex.synchronize { found["#{peer}:#{info['port']}"] = info }
+      end
+    end
+
+    payload = self_info.to_json
+    conn.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" \
+               "Content-Length: #{payload.bytesize}\r\n\r\n#{payload}")
+  rescue StandardError
+    nil
+  ensure
+    begin
+      conn.close
+    rescue StandardError
+      nil
+    end
+  end
+
   # Announce ourselves on the group and collect the replies.
   def discover_multicast(timeout: 2.0)
     found = {}
+    mutex = Mutex.new
+    listener, listener_socket = start_register_listener(found, mutex)
+
     sock = UDPSocket.new
     sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, 1)
     sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEPORT, 1) if defined?(Socket::SO_REUSEPORT)
@@ -114,6 +183,8 @@ module LocalSend
                       IPAddr.new(MULTICAST).hton + IPAddr.new('0.0.0.0').hton)
     rescue SystemCallError
       sock.close
+      sleep timeout if listener # HTTP replies may still be arriving.
+      stop_listener(listener, listener_socket)
       return found
     end
 
@@ -138,10 +209,20 @@ module LocalSend
 
       info['ip'] = addr[3]
       info['port'] ||= PORT
-      found["#{info['ip']}:#{info['port']}"] = info
+      mutex.synchronize { found["#{info['ip']}:#{info['port']}"] = info }
     end
     sock.close
+    stop_listener(listener, listener_socket)
     found
+  end
+
+  def stop_listener(thread, socket)
+    return unless thread
+
+    socket.close
+    thread.join(1)
+  rescue StandardError
+    nil
   end
 
   # POST our info to one host; a 200 means it is a LocalSend device.
@@ -166,25 +247,53 @@ module LocalSend
     nil
   end
 
-  # Fallback when nothing answers the multicast: register against every host
-  # on the local /24.
-  def discover_sweep
+  # The interface's real subnet, not an assumed /24 — an office network is
+  # routinely a /23 or /22, and half its hosts are invisible if we guess.
+  def local_subnet
     mine = local_ip
-    return {} unless mine
+    return nil unless mine
 
-    prefix = mine.rpartition('.').first
+    ifaddr = Socket.getifaddrs.find do |i|
+      i.addr&.ipv4? && i.netmask&.ipv4? && i.addr.ip_address == mine
+    end
+    return nil unless ifaddr
+
+    prefix = IPAddr.new(ifaddr.netmask.ip_address).to_i.to_s(2).count('1')
+    [mine, IPAddr.new("#{mine}/#{prefix}")]
+  end
+
+  # Fallback when nothing answers the multicast: register against every host on
+  # the local subnet.
+  def discover_sweep
+    mine, network = local_subnet
+    return {} unless network
+
+    hosts = network.to_range.map(&:to_s) - [mine, network.to_range.first.to_s,
+                                            network.to_range.last.to_s]
+    if hosts.size > MAX_SWEEP_HOSTS
+      warn "Subnet #{network}/#{network.prefix} has #{hosts.size} addresses — too many to sweep."
+      warn 'Only multicast can find devices here.'
+      return {}
+    end
+
     found = {}
     mutex = Mutex.new
+    queue = Queue.new
+    hosts.each { |h| queue << h }
 
-    (1..254).map do |i|
-      ip = "#{prefix}.#{i}"
-      next if ip == mine
-
+    workers = [SWEEP_CONCURRENCY, hosts.size].min
+    Array.new(workers) do
       Thread.new do
-        info = register(ip)
-        mutex.synchronize { found["#{ip}:#{info['port']}"] = info } if info
+        while (ip = begin
+          queue.pop(true)
+        rescue ThreadError
+          nil
+        end)
+          info = register(ip)
+          mutex.synchronize { found["#{ip}:#{info['port']}"] = info } if info
+        end
       end
-    end.compact.each(&:join)
+    end.each(&:join)
 
     found
   end
