@@ -36,14 +36,14 @@ Then bind a key in `~/.config/yazi/keymap.toml`:
 
 ```toml
 [[mgr.prepend_keymap]]
-on   = "<C-l>"
+on   = "W"
 run  = "plugin localsend"
 desc = "Send files via LocalSend"
 ```
 
 ## Usage
 
-Select files (or just hover one) and press `ctrl+l`. The plugin discovers devices,
+Select files (or just hover one) and press `shift+w`. The plugin discovers devices,
 lists them in fzf, and uploads to whichever you pick. The receiving device shows
 its usual accept prompt.
 
